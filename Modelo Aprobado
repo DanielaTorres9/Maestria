@@ -1,0 +1,302 @@
+library(readxl)
+library(fastDummies)
+library(caret)
+library(catboost)
+library(rpart)
+library(rpart.plot)
+library(Boruta)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(nnet)
+
+
+X2019_Jovenes <- read_excel("C:/Users/Usuario/Desktop/Daniela/UNIVERSIDAD MAESTRIA/Investigacion 3/Modelo aprobados/2019 Jovenes.xlsx")
+X2020_Jovenes <- read_excel("C:/Users/Usuario/Desktop/Daniela/UNIVERSIDAD MAESTRIA/Investigacion 3/Modelo aprobados/2020 Jovenes.xlsx")
+X2021_Jovenes <- read_excel("C:/Users/Usuario/Desktop/Daniela/UNIVERSIDAD MAESTRIA/Investigacion 3/Modelo aprobados/2021 Jovenes.xlsx")
+X2022_Jovenes <- read_excel("C:/Users/Usuario/Desktop/Daniela/UNIVERSIDAD MAESTRIA/Investigacion 3/Modelo aprobados/2022 Jovenes.xlsx")
+
+
+base <- rbind(X2019_Jovenes,X2020_Jovenes,X2021_Jovenes,X2022_Jovenes)
+
+base$Ingresos_SMMLV <-base$Ingresos/base$SMMLV
+base$Ingresos_Solicitud_SMMLV <-base$`Ingresos Solicitud`/base$SMMLV
+base$Valor_Solicitado_SMMLV <-base$`Valor Solicitado`/base$SMMLV
+base$Vr_Aprobado_SMMLV <-base$`Vr Aprobado`/base$SMMLV
+base$VCI_SMMLV <-base$`Valor Comercial Inmueble`/base$SMMLV
+base$Valor_Avaluo_SMMLV <-base$`Valor Avaluo`/base$SMMLV
+base$Endeudamiento_SMMLV <-base$Endeudamiento/base$SMMLV
+
+
+variables_cxcluir <- c("Ingresos","Ingresos Solicitud", "Valor Solicitado",
+                       "Vr Aprobado", "Valor Comercial Inmueble", "Valor Avaluo","Regional",
+                       "Nombre Oficina", "Nombre Sucursal", "Oficina", "Nueva Causal de Negacion",
+                       "Linea", "Linea Credito","Endeudamiento", "Mes", "Nombre Constructora", "SMMLV"
+                       )
+
+posicion <- setdiff(names(base), variables_cxcluir)
+Base_filtrada <- base[, posicion]
+
+oot <- subset(Base_filtrada,Base_filtrada$`Fecha Decision`>20221000)
+Base_construccion <- subset(Base_filtrada,Base_filtrada$`Fecha Decision`<=20221000)
+
+oot <- oot[,-3]
+Base_construccion  <-Base_construccion[,-3] 
+
+
+
+variables_objetivo <- c("Decision definitiva","Ciudad del Inmueble","Estrategia"
+                         )
+ 
+posicion <- setdiff(names(Base_construccion), variables_objetivo)
+Base_construccion_filtrada <- Base_construccion[, posicion]
+objetivo <- Base_construccion[, variables_objetivo]
+ 
+# #Separar datos en cualitativos y cuantitativos
+
+cuantitativo_c <- sapply(Base_construccion_filtrada, is.numeric)
+cualitativo_c <- sapply(Base_construccion_filtrada, is.character)
+
+cuantitativo <- Base_construccion_filtrada[, cuantitativo_c]
+cualitativo <- Base_construccion_filtrada[, cualitativo_c]
+
+
+cualitativo$`Feria Hipotecaria`<- ifelse(is.na(cualitativo$`Feria Hipotecaria`),"No",cualitativo$`Feria Hipotecaria`)
+cualitativo$`Aplica Cobertura`<- ifelse(is.na(cualitativo$`Aplica Cobertura`),"No",cualitativo$`Aplica Cobertura`)
+
+cuantitativo[is.na(cuantitativo)] <- 0
+
+#Transformación de datos cualitativos
+
+dummies <- dummy_cols(cualitativo, remove_first_dummy = F, remove_selected_columns = T)
+
+Base_unida <- cbind(objetivo,cuantitativo,dummies)
+
+
+# VAriables y objetivo
+y <- Base_unida$`Decision definitiva`
+X <- Base_unida[, -1]
+
+
+#Divir en 70% entrenamiento 30% validacion
+set.seed(12345)
+
+trainIndex <- createDataPartition(y, p = .7, list = FALSE)
+X_train <- X[trainIndex, ]
+y_train <- y[trainIndex]
+X_test <- X[-trainIndex, ]
+y_test <- y[-trainIndex]
+
+
+# Calcular los parámetros de normalización con el conjunto de entrenamiento
+
+
+X_train_cuantitativo <- X_train[, c(names(cuantitativo))]
+vars <- setdiff(names(X_train), names(cuantitativo))
+X_train_cualitativo <- X_train[, vars]
+
+X_test_cuantitativo <- X_test[, c(names(cuantitativo))]
+vars <- setdiff(names(X_test), names(cuantitativo))
+X_test_cualitativo <- X_test[, vars]
+
+
+
+preProcValues <- preProcess(X_train_cuantitativo, method = c("center", "scale"))
+
+X_train_normalized <- predict(preProcValues, X_train_cuantitativo)
+
+X_train_F <- cbind(X_train_cualitativo,X_train_normalized)
+
+Base_train <-cbind(y_train,X_train_F)
+
+Base_train <- na.omit(Base_train)
+
+X_test_normalized <- predict(preProcValues, X_test_cuantitativo)
+
+X_test_F <- cbind(X_test_cualitativo,X_test_normalized)
+
+Base_test<-cbind(y_test,X_test_F)
+
+Base_test <- na.omit(Base_test)
+
+
+# Aplicar Boruta para la selección de variables
+boruta_output <- Boruta(y_train ~ ., data = Base_train, doTrace = 2)
+
+print(boruta_output)
+
+variables_seleccionadas<- getSelectedAttributes(boruta_output, withTentative = FALSE)
+print(variables_seleccionadas)
+
+variables_seleccionadas <- variables_seleccionadas[-c(1,2.26)]
+print(variables_seleccionadas)
+
+
+# Crear un nuevo conjunto de datos con solo las variables seleccionadas
+train_data_sel <- Base_train[, c(variables_seleccionadas, "y_train")]
+test_data_sel <- Base_test[, c(variables_seleccionadas, "y_test")]
+
+
+
+
+
+######XGBoost ######
+dtrain <- xgb.DMatrix(data = as.matrix(train_data_sel[, -ncol(train_data_sel)]), label = train_data_sel$y_train )
+dtest <- xgb.DMatrix(data = as.matrix(test_data_sel[, -ncol(test_data_sel)]), label = test_data_sel$y_test)
+
+
+
+# Configurar los parámetros del modelo
+parametros <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 6,
+  eta = 0.1,
+  nthread = 2
+)
+
+# Entrenar el modelo
+model <- xgb.train(parametros, dtrain, nrounds = 100)
+
+# Realizar predicciones
+predictions_train <- predict(model, dtrain)
+
+predictions_test <- predict(model, dtest)
+
+
+roc_obj_train <- roc(as.numeric(train_data_sel$y_train), predictions_train)
+plot(roc_obj_train, main = "Curva ROC")
+print(roc_obj_train)
+
+roc_obj <- roc(as.numeric(test_data_sel$y_test), predictions_test)
+plot(roc_obj, main = "Curva ROC")
+print(roc_obj)
+
+
+predicted_classes_train <- ifelse(predictions_train > 0.9816, 1, 0)
+predicted_classes_test <- ifelse(predictions_test > 0.9816, 1, 0)
+
+
+#Matriz confusion
+
+confusion_matrix_train <- confusionMatrix(as.factor(predicted_classes_train), as.factor(train_data_sel$y_train))
+
+print(confusion_matrix_train)
+
+confusion_matrix_test <- confusionMatrix(as.factor(predicted_classes_test), as.factor(test_data_sel$y_test))
+
+print(confusion_matrix_test)
+
+
+
+# Calcular el AUC
+
+roc_obj_train <- roc(train_data_sel$y_train, predicted_classes_train)
+print(paste("AUC:", auc(roc_obj_train)))
+
+roc_obj_test <- roc(test_data_sel$y_test, predicted_classes_test)
+print(paste("AUC:", auc(roc_obj_test)))
+
+
+#####CatBOOSt #####
+
+dtrain_cat <- catboost.load_pool(data = train_data_sel[, -ncol(train_data_sel)], label = as.numeric(train_data_sel$y_train) )
+dtest_cat <- catboost.load_pool(data = test_data_sel[, -ncol(test_data_sel)], label = as.numeric(test_data_sel$y_test))
+
+
+# Definir los parámetros del modelo
+params <- list(
+  loss_function = 'Logloss',
+  iterations = 100,
+  depth = 6,
+  learning_rate = 0.1,
+  custom_metric = list('AUC', 'Accuracy')
+)
+
+model <- catboost.train(dtrain_cat, params = params)
+
+
+predictions_train_cat <- catboost.predict(model, dtrain_cat, prediction_type = 'Probability')
+
+predictions_test_cat <- catboost.predict(model, dtest_cat, prediction_type = 'Probability')
+
+roc_obj_train_cat <- roc(as.numeric(train_data_sel$y_train), predictions_train_cat)
+plot(roc_obj_train_cat, main = "Curva ROC cat train")
+print(roc_obj_train_cat)
+
+roc_obj_cat <- roc(as.numeric(test_data_sel$y_test), predictions_test_cat)
+plot(roc_obj_cat, main = "Curva ROC cat test")
+print(roc_obj_cat)
+
+
+predicted_classes_train_cat <- ifelse(predictions_train_cat > 0.9789, 1, 0)
+
+predicted_classes_test_cat <- ifelse(predictions_test_cat > 0.9789, 1, 0)
+
+
+
+#Matriz confusion
+
+confusion_matrix_train_cat <- confusionMatrix(as.factor(predicted_classes_train_cat), as.factor(train_data_sel$y_train))
+
+print(confusion_matrix_train_cat)
+
+confusion_matrix_test_cat <- confusionMatrix(as.factor(predicted_classes_test_cat), as.factor(test_data_sel$y_test))
+
+print(confusion_matrix_test_cat)
+
+
+
+# Calcular el AUC
+
+roc_obj_train_cat <- roc(train_data_sel$y_train, predicted_classes_train_cat)
+print(paste("AUC:", auc(roc_obj_train_cat)))
+
+roc_obj_test_cat <- roc(test_data_sel$y_test, predicted_classes_test_cat)
+print(paste("AUC:", auc(roc_obj_test_cat)))
+
+##### NN #####
+
+x_train_nn <- test_data_sel[, -ncol(train_data_sel)]
+y_train_nn <-  train_data_sel$y_train
+x_test_nn <- test_data_sel[, -ncol(test_data_sel)]
+y_test_nn <- test_data_sel$y_test
+
+nn_model <- nnet(y_train ~ ., data = train_data_sel, size = 5, maxit = 200, decay = 0.1)
+
+predictions_train_nn <- predict(nn_model, train_data_sel)
+predictions_test_nn <- predict(nn_model, test_data_sel)
+
+
+roc_obj_train_nn <- roc(as.numeric(train_data_sel$y_train), as.numeric(predictions_train_nn))
+plot(roc_obj_train_nn, main = "Curva ROC nn train")
+print(roc_obj_train_nn)
+
+roc_obj_nn <- roc(as.numeric(test_data_sel$y_test), as.numeric(predictions_test_nn))
+plot(roc_obj_nn, main = "Curva ROC nn test")
+print(roc_obj_nn)
+
+
+predicted_classes_train_nn <- ifelse(predictions_train_nn > 0.9753, 1, 0)
+
+predicted_classes_test_nn <- ifelse(predictions_test_nn > 0.9753, 1, 0)
+
+
+#Matriz confusion
+
+confusion_matrix_train_nn <- confusionMatrix(as.factor(predicted_classes_train_nn), as.factor(y_train_nn))
+
+print(confusion_matrix_train_nn)
+
+confusion_matrix_test_nn <- confusionMatrix(as.factor(predicted_classes_test_nn), as.factor(y_test_nn))
+
+print(confusion_matrix_test_nn)
+
+
+# Calcular el AUC
+
+roc_obj_train_nn <- roc(train_data_sel$y_train, as.numeric(predicted_classes_train_nn))
+print(paste("AUC:", auc(roc_obj_train_nn)))
+
+roc_obj_test_nn <- roc(test_data_sel$y_test, as.numeric(predicted_classes_test_nn))
+print(paste("AUC:", auc(roc_obj_test_nn)))
